@@ -219,14 +219,22 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
 
         # Extract frames
         progress(0.1, desc=f"Extracting {n_frames} frames...")
+        print(f"\n{'='*60}")
+        print(f"DEBUG: VIDEO PROCESSING STARTED")
+        print(f"{'='*60}")
+        print(f"Video path: {video_path}")
+
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        indices = np.linspace(0, total_frames - 1, n_frames, dtype=int)
-        frames = []
+        print(f"Video info: {width}x{height}, {total_frames} frames")
 
+        indices = np.linspace(0, total_frames - 1, n_frames, dtype=int)
+        print(f"Extracting frames at indices: {indices}")
+
+        frames = []
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
@@ -234,24 +242,30 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()
 
+        print(f"Extracted {len(frames)} frames successfully")
+
         if len(frames) == 0:
             return "❌ Error: Could not extract frames from video", None, None
 
         # Pose estimation (NEW API)
+        print(f"\n{'='*60}")
+        print(f"DEBUG: POSE DETECTION")
+        print(f"{'='*60}")
         progress(0.2, desc="Running pose estimation...")
         pose_results = []
         for i, frame in enumerate(frames):
             result = detect_pose_new_api(frame, pose_landmarker)
             pose_results.append(result)
+            if result is not None:
+                n_visible = np.sum(result['keypoints'][:, 2] > 0.5)
+                bbox_area = (result['bbox'][2] - result['bbox'][0]) * (result['bbox'][3] - result['bbox'][1])
+                print(f"  Frame {i}: ✓ {n_visible}/17 keypoints, bbox area={bbox_area:.0f}px²")
+            else:
+                print(f"  Frame {i}: ✗ No pose detected")
             progress(0.2 + 0.2 * (i+1)/len(frames), desc=f"Processing frame {i+1}/{len(frames)}")
 
         valid_poses = [p for p in pose_results if p is not None]
-
-        # DEBUG: Show detection results
-        print(f"DEBUG: Detected poses in {len(valid_poses)}/{len(frames)} frames")
-        for i, pose in enumerate(pose_results):
-            if pose is not None:
-                print(f"  Frame {i}: {np.sum(pose['keypoints'][:, 2] > 0.5)} visible keypoints")
+        print(f"\nSummary: {len(valid_poses)}/{len(frames)} frames with valid poses")
 
         if len(valid_poses) < 3:
             return f"❌ Error: Only {len(valid_poses)} frames detected person. Need at least 3.", None, None
@@ -261,20 +275,29 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
         K = np.array([[focal, 0, width/2], [0, focal, height/2], [0, 0, 1]], dtype=np.float64)
 
         # Iterative PnP (3 rounds)
+        print(f"\n{'='*60}")
+        print(f"DEBUG: CAMERA ESTIMATION (Iterative PnP)")
+        print(f"{'='*60}")
         progress(0.4, desc="Iterative camera estimation (3 rounds)...")
         betas = torch.zeros(1, 10, device=device)
         cameras = [None] * len(pose_results)
 
         for iteration in range(3):
             joints_3d = get_smplx_joints(body_model, betas, device)
+            print(f"\nPnP Round {iteration+1}/3:")
 
+            successful_cameras = 0
             for i, pose in enumerate(pose_results):
                 if pose is None:
                     continue
                 R, t, success = solve_pnp(pose['keypoints'], joints_3d, K)
                 if success:
                     cameras[i] = {'R': R, 't': t, 'K': K.copy()}
+                    successful_cameras += 1
+                    if iteration == 0:  # Only log first round to avoid spam
+                        print(f"  Frame {i}: ✓ Camera solved, distance={np.linalg.norm(t):.2f}m")
 
+            print(f"  Success: {successful_cameras}/{len(valid_poses)} cameras estimated")
             progress(0.4 + 0.1 * (iteration+1)/3, desc=f"PnP round {iteration+1}/3")
 
             # Quick shape update
@@ -315,11 +338,16 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
                     optimizer.step()
 
                 betas = betas_opt.detach()
+                print(f"  Shape updated: β = [{betas[0, 0].item():.3f}, {betas[0, 1].item():.3f}, ...]")
 
         # Final optimization
+        print(f"\n{'='*60}")
+        print(f"DEBUG: FINAL SHAPE OPTIMIZATION (200 iterations)")
+        print(f"{'='*60}")
         progress(0.5, desc="Final shape optimization...")
         betas_final = betas.clone().detach().requires_grad_(True)
         optimizer = torch.optim.Adam([betas_final], lr=0.02)
+        print(f"Initial betas: {betas_final[0, :5].detach().cpu().numpy()}")
 
         for iteration in range(200):
             optimizer.zero_grad()
@@ -376,12 +404,16 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
             optimizer.step()
 
             if iteration % 50 == 0:
-                print(f"DEBUG: Iter {iteration}, Loss={total_loss.item():.4f}, β0={betas_final[0,0].item():.3f}, β1={betas_final[0,1].item():.3f}")
+                print(f"Iter {iteration:3d}: Loss={total_loss.item():.4f} (kp={kp_loss.item():.2f}, sym={symmetry_loss.item():.4f}, shape={shape_loss.item():.4f})")
+                print(f"          β = [{betas_final[0,0].item():+.3f}, {betas_final[0,1].item():+.3f}, {betas_final[0,2].item():+.3f}, {betas_final[0,3].item():+.3f}, {betas_final[0,4].item():+.3f}, ...]")
                 progress(0.5 + 0.3 * iteration/200, desc=f"Optimization iter {iteration}/200")
 
         # Extract measurements
+        print(f"\n{'='*60}")
+        print(f"DEBUG: MEASUREMENT EXTRACTION")
+        print(f"{'='*60}")
         progress(0.85, desc="Extracting measurements...")
-        print(f"DEBUG: Final betas = {betas_final[0, :5].detach().cpu().numpy()}")
+        print(f"Final optimized betas: {betas_final[0, :10].detach().cpu().numpy()}")
 
         with torch.no_grad():
             output = body_model(
@@ -394,9 +426,12 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
         vertices = output.vertices[0].cpu().numpy()
         joints = output.joints[0].cpu().numpy()
 
+        print(f"Generated mesh: {vertices.shape[0]} vertices, {len(body_model.faces)} faces")
+
         # Scale
         raw_height = vertices[:, 1].max() - vertices[:, 1].min()
         scale = known_height / raw_height if known_height and known_height > 0 else 100
+        print(f"Raw height: {raw_height:.4f}m, Scale factor: {scale:.2f}, Known height: {known_height if known_height else 'None'}")
 
         # Measurements
         measurements = {}
@@ -428,6 +463,14 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
 
         hip_center = joints[0].copy()
         measurements['hip_circumference'] = measure_circumference_pca(vertices, hip_center, 0.12, scale)
+
+        # Log measurements
+        print(f"\n{'='*60}")
+        print(f"FINAL MEASUREMENTS:")
+        print(f"{'='*60}")
+        for name, value in measurements.items():
+            print(f"  {name:<25} {value:>8.1f} cm")
+        print(f"{'='*60}\n")
 
         # Format output
         progress(0.95, desc="Generating results...")
