@@ -9,6 +9,7 @@ import os
 import json
 import tempfile
 import urllib.request
+import shutil
 
 # MediaPipe NEW Tasks API
 import mediapipe as mp
@@ -203,9 +204,16 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
         if not smplx_model_path or not os.path.exists(smplx_model_path):
             return "❌ Error: Please upload SMPLX_NEUTRAL.npz model", None, None
 
-        smplx_dir = os.path.dirname(smplx_model_path)
+        # Create proper directory structure for SMPL-X
+        smplx_dir = 'models/smplx'
+        os.makedirs(smplx_dir, exist_ok=True)
+
+        # Copy uploaded file to proper location
+        target_path = os.path.join(smplx_dir, 'SMPLX_NEUTRAL.npz')
+        shutil.copy(smplx_model_path, target_path)
+
         body_model = smplx.create(
-            smplx_dir, model_type='smplx', gender='neutral',
+            'models', model_type='smplx', gender='neutral',
             use_face_contour=False, num_betas=10, ext='npz'
         ).to(device)
 
