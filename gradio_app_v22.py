@@ -404,7 +404,13 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
             optimizer.step()
 
             if iteration % 50 == 0:
-                print(f"Iter {iteration:3d}: Loss={total_loss.item():.4f} (kp={kp_loss.item():.2f}, sym={symmetry_loss.item():.4f}, shape={shape_loss.item():.4f})")
+                # Handle both tensor and float values
+                kp_val = kp_loss.item() if torch.is_tensor(kp_loss) else kp_loss
+                sym_val = symmetry_loss.item() if torch.is_tensor(symmetry_loss) else symmetry_loss
+                shape_val = shape_loss.item() if torch.is_tensor(shape_loss) else shape_loss
+                total_val = total_loss.item() if torch.is_tensor(total_loss) else total_loss
+
+                print(f"Iter {iteration:3d}: Loss={total_val:.4f} (kp={kp_val:.2f}, sym={sym_val:.4f}, shape={shape_val:.4f})")
                 print(f"          β = [{betas_final[0,0].item():+.3f}, {betas_final[0,1].item():+.3f}, {betas_final[0,2].item():+.3f}, {betas_final[0,3].item():+.3f}, {betas_final[0,4].item():+.3f}, ...]")
                 progress(0.5 + 0.3 * iteration/200, desc=f"Optimization iter {iteration}/200")
 
