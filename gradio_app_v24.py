@@ -364,7 +364,7 @@ def optimize_shape_balanced(pose_results, cameras, body_model, device,
             best_betas = betas.clone().detach()
         
         if iteration % 50 == 0:
-            beta_str = ", ".join([f"{b:.2f}" for b in betas[0, :5].cpu().numpy()])
+            beta_str = ", ".join([f"{b:.2f}" for b in betas[0, :5].detach().cpu().numpy()])
             log(f"Iter {iteration}: loss={total_loss.item():.4f}, kp={kp_loss.item():.4f}, "
                 f"sil={sil_loss.item():.4f}, ratio={ratio.item():.2f}, betas=[{beta_str}]", "DEBUG")
     
