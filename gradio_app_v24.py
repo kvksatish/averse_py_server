@@ -72,8 +72,11 @@ def detect_pose_with_segmentation(image_rgb, frame_idx=0):
     # Get segmentation mask
     seg_mask = None
     if result.segmentation_masks and len(result.segmentation_masks) > 0:
-        seg_mask = result.segmentation_masks[0].numpy_view()
-        seg_mask = (seg_mask > 0.5).astype(np.uint8)
+        seg_raw = result.segmentation_masks[0].numpy_view()
+        # Ensure 2D
+        if len(seg_raw.shape) == 3:
+            seg_raw = seg_raw[:, :, 0]
+        seg_mask = (seg_raw > 0.5).astype(np.uint8)
     
     # Compute width profile from segmentation
     width_profile = None
@@ -92,6 +95,17 @@ def compute_width_profile(seg_mask, n_samples=20):
     Compute body width at different heights from segmentation mask.
     Returns: array of (y_position, width) pairs normalized to [0,1]
     """
+    # Handle different mask shapes
+    if seg_mask is None:
+        return None
+    
+    # Ensure 2D mask
+    if len(seg_mask.shape) == 3:
+        seg_mask = seg_mask[:, :, 0] if seg_mask.shape[2] > 0 else seg_mask.squeeze()
+    
+    if len(seg_mask.shape) != 2:
+        return None
+    
     h, w = seg_mask.shape
     
     # Find body bounding box
