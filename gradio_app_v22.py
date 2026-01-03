@@ -246,6 +246,13 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
             progress(0.2 + 0.2 * (i+1)/len(frames), desc=f"Processing frame {i+1}/{len(frames)}")
 
         valid_poses = [p for p in pose_results if p is not None]
+
+        # DEBUG: Show detection results
+        print(f"DEBUG: Detected poses in {len(valid_poses)}/{len(frames)} frames")
+        for i, pose in enumerate(pose_results):
+            if pose is not None:
+                print(f"  Frame {i}: {np.sum(pose['keypoints'][:, 2] > 0.5)} visible keypoints")
+
         if len(valid_poses) < 3:
             return f"❌ Error: Only {len(valid_poses)} frames detected person. Need at least 3.", None, None
 
@@ -369,10 +376,13 @@ def process_video(video_path, smplx_model_path, known_height, n_frames, progress
             optimizer.step()
 
             if iteration % 50 == 0:
+                print(f"DEBUG: Iter {iteration}, Loss={total_loss.item():.4f}, β0={betas_final[0,0].item():.3f}, β1={betas_final[0,1].item():.3f}")
                 progress(0.5 + 0.3 * iteration/200, desc=f"Optimization iter {iteration}/200")
 
         # Extract measurements
         progress(0.85, desc="Extracting measurements...")
+        print(f"DEBUG: Final betas = {betas_final[0, :5].detach().cpu().numpy()}")
+
         with torch.no_grad():
             output = body_model(
                 betas=betas_final,
